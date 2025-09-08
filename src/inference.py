@@ -6,6 +6,7 @@ import time
 from abc import ABC, abstractmethod
 
 import cohere
+import torch
 from aiofiles import open as aio_open
 from anthropic import AsyncAnthropicVertex
 from datasets import load_dataset
@@ -14,6 +15,7 @@ from google.auth import default, transport
 from google.genai import types
 from openai import AsyncOpenAI
 from tqdm.auto import tqdm
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from src.common import oai_client
 
@@ -166,6 +168,137 @@ class DeepSeekService(OpenAIService):
             )
 
 
+class TransformersService(InferenceService):
+    def __init__(self, model: str):
+        self.model_name = model
+        print(f"Loading tokenizer and model for {model}...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model, 
+                trust_remote_code=True,
+                dtype=torch.bfloat16,
+                device_map="auto",
+                attn_implementation="flash_attention_2"  # Use flash attention if available
+            )
+        except:
+            print("Flash attention not available, falling back to eager attention")
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model, 
+                trust_remote_code=True,
+                dtype=torch.bfloat16,
+                device_map="auto",
+                attn_implementation="eager"
+            )
+        
+        # Set pad token if it doesn't exist
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+        print(f"Model loaded on device: {self.model.device}")
+        print(f"Model memory footprint: {self.model.get_memory_footprint() / 1e9:.2f} GB")
+        print(f"Model loaded successfully!")
+
+    async def generate(
+        self, model: str, messages: list[dict[str, str]], n=1, max_tokens=512, temperature=1.0, stop=None, **kwargs
+    ) -> list[str]:
+        # Run the actual generation in a thread to avoid blocking
+        import asyncio
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._generate_sync, messages, n, max_tokens, temperature, stop, kwargs)
+    
+    def _generate_sync(self, messages, n, max_tokens, temperature, stop, kwargs):
+        # Apply chat template to convert messages to a prompt
+        try:
+            # prompt = self.tokenizer.apply_chat_template(
+            #     messages, tokenize=False, add_generation_prompt=True
+            # )
+            inputs = self.tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True, return_tensors="pt", padding=False, truncation=True, max_length=4000
+            )
+        except Exception as e:
+            print(f"Chat template failed: {e}, using fallback")
+            raise Exception(f"Chat template failed: {e}")
+
+        inputs = inputs.to(self.model.device)
+        
+        # Use batch generation for efficiency if n > 1
+        if n > 1 and hasattr(self.model, 'generate') and temperature > 0:
+            # print(f"Generating {n} responses in batch...")
+            with torch.no_grad():
+                input_ids = inputs.repeat(n, 1)
+                attention_mask = torch.ones_like(input_ids)
+                # Generate all responses in a single batch call
+                outputs = self.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=max_tokens,
+                    temperature=temperature,
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    use_cache=True,  # Enable KV cache for faster generation
+                    **kwargs
+                )
+                
+                # Decode all responses
+                responses = []
+                input_length = input_ids.shape[1]
+                for i in range(n):
+                    generated_tokens = outputs[i][input_length:]
+                    response = self.tokenizer.decode(generated_tokens, skip_special_tokens=False)
+                    
+                    # Apply stop sequences
+                    if stop:
+                        for stop_seq in stop:
+                            if stop_seq in response:
+                                response = response.split(stop_seq)[0]
+                    
+                    response = response.strip()
+                    responses.append(response)
+        else:
+            # Sequential generation for n=1 or when batch generation isn't suitable
+            responses = []
+            for i in range(n):
+                print(f"Generating response {i+1}/{n}...")
+                with torch.no_grad():
+                    outputs = self.model.generate(
+                        **inputs,
+                        max_new_tokens=max_tokens,
+                        temperature=temperature,
+                        do_sample=True if temperature > 0 else False,
+                        pad_token_id=self.tokenizer.pad_token_id,
+                        eos_token_id=self.tokenizer.eos_token_id,
+                        use_cache=True,  # Enable KV cache
+                        **kwargs
+                    )
+                    
+                    # Decode only the generated part
+                    generated_tokens = outputs[0][inputs['input_ids'].shape[1]:]
+                    response = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+                    
+                    # Apply stop sequences
+                    if stop:
+                        for stop_seq in stop:
+                            if stop_seq in response:
+                                response = response.split(stop_seq)[0]
+                    
+                    response = response.strip()
+                    responses.append(response)
+                    print(f"Generated: {response[:100]}...")
+        
+        return responses
+    
+    def cleanup(self):
+        # Clean up GPU memory
+        if hasattr(self, 'model'):
+            del self.model
+        if hasattr(self, 'tokenizer'):
+            del self.tokenizer
+        torch.cuda.empty_cache()
+        print("Done!")
+
+
 async def run_generation(
     service: InferenceService,
     model: str,
@@ -187,6 +320,7 @@ async def run_generation(
                     max_tokens=512,
                     temperature=1.0,
                     n=num_generations,
+                    stop=["<|end_of_text|>", "<eos>", "<end_of_turn>"],
                 )
 
             elif sampling == "in-context":
@@ -196,6 +330,7 @@ async def run_generation(
                         messages=messages,
                         max_tokens=512,
                         temperature=1.0,
+                        stop=["<|end_of_text|>", "<eos>", "<end_of_turn>"],
                     )
                     new_response = response[0]
                     responses.append(new_response)
@@ -218,6 +353,7 @@ async def run_generation(
                         messages=messages,
                         max_tokens=512,
                         temperature=1.0,
+                        stop=["<|end_of_text|>", "<eos>", "<end_of_turn>"],
                     )
                     new_response = response[0]
                     responses.append(new_response)
@@ -236,6 +372,7 @@ async def run_generation(
                     max_tokens=512,
                     temperature=1.0,
                     n=num_generations,
+                    stop=["<|end_of_text|>", "<eos>", "<end_of_turn>"],
                 )
             else:
                 raise Exception("Unknown mode " + sampling)
@@ -308,9 +445,10 @@ async def main():
             "anthropic",
             "vertex",
             "deepseek",
+            "transformers",
         ],
         required=True,
-        help="Inference service provider (vllm for local server, openai for API, etc.)",
+        help="Inference service provider (vllm for local server, openai for API, transformers for local HF models, etc.)",
     )
     parser.add_argument("--model", required=True, help="Model to run inference with")
     parser.add_argument(
@@ -388,8 +526,12 @@ async def main():
         service = VertexService()
     elif args.mode == "deepseek":
         service = DeepSeekService()
+    elif args.mode == "transformers":
+        service = TransformersService(args.model)
+        # Reduce concurrent requests for local inference to avoid memory issues
+        concurrent_requests = 1
     else:
-        raise Exception(f"unknown service {service}")
+        raise Exception(f"unknown service {args.mode}")
     try:
         await process_prompts(
             dataset,

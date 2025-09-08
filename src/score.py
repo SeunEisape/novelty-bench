@@ -42,7 +42,7 @@ def rm_and_tokenizer():
         model_name,
         torch_dtype=torch.bfloat16,
         device_map="auto",
-        attn_implementation="flash_attention_2",
+        attn_implementation="eager",
         num_labels=1,
     )
     tokenizer = AutoTokenizer.from_pretrained(model_name)
