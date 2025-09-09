@@ -307,9 +307,12 @@ async def run_generation(
     num_generations: int,
     sampling: str,
     max_retries: int = 10,
+    stop_sequences: list[str] | None = None,
 ) -> list[str]:
     responses = []
     messages = [{"role": "user", "content": prompt}]
+    if stop_sequences is None:
+        stop_sequences = ["<|end_of_text|>", "<eos>", "<end_of_turn>"] # These may need to be adjusted depending on the model
     for attempt in range(max_retries):
         try:
             if sampling == "regenerate":
@@ -320,7 +323,7 @@ async def run_generation(
                     max_tokens=512,
                     temperature=1.0,
                     n=num_generations,
-                    stop=["<|end_of_text|>", "<eos>", "<end_of_turn>"],
+                    stop=stop_sequences,
                 )
 
             elif sampling == "in-context":
@@ -330,7 +333,7 @@ async def run_generation(
                         messages=messages,
                         max_tokens=512,
                         temperature=1.0,
-                        stop=["<|end_of_text|>", "<eos>", "<end_of_turn>"],
+                        stop=stop_sequences,
                     )
                     new_response = response[0]
                     responses.append(new_response)
@@ -353,7 +356,7 @@ async def run_generation(
                         messages=messages,
                         max_tokens=512,
                         temperature=1.0,
-                        stop=["<|end_of_text|>", "<eos>", "<end_of_turn>"],
+                        stop=stop_sequences,
                     )
                     new_response = response[0]
                     responses.append(new_response)
@@ -372,7 +375,7 @@ async def run_generation(
                     max_tokens=512,
                     temperature=1.0,
                     n=num_generations,
-                    stop=["<|end_of_text|>", "<eos>", "<end_of_turn>"],
+                    stop=stop_sequences,
                 )
             else:
                 raise Exception("Unknown mode " + sampling)
@@ -418,6 +421,7 @@ async def process_prompts(
                     prompt.get("prompt_paraphrases"),
                     num_generations,
                     sampling,
+                    stop_sequences,
                 )
                 return {
                     "id": prompt["id"],
