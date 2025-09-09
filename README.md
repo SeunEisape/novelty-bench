@@ -88,7 +88,7 @@ If you have any questions, please create an issue. Otherwise, you can also conta
 
 This project is licensed under the MIT License - see the LICENSE file for details.
 
-# TAYLOR - gemma 1b
+# Full Worked Example
 
 For example, to run gemma-3-1b-it from start to finish:
 ```bash
