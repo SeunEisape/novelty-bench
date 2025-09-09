@@ -87,3 +87,72 @@ If you have any questions, please create an issue. Otherwise, you can also conta
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
+
+# Full Worked Example
+
+For example, to run gemma-3-1b-it from start to finish:
+```bash
+export MODEL_NAME=google/gemma-3-1b-it
+export SPLIT=curated
+```
+
+1. **Inference**: Generate multiple responses from language models
+#### WITH VLLM
+(may need to add model name to `model-lists/VLLM_MODELS` if not present)
+Set up the VLLM server:
+```bash
+# Set environment variable for port
+export VLLM_PORT=8000
+
+# Start VLLM server
+uv run vllm serve $MODEL_NAME --port 8000 --served-model-name $MODEL_NAME > vllm.log 2>&1 &
+```
+
+**Note**: The server takes 1-2 minutes to initialize and load the model.
+
+```bash
+uv run python src/inference.py \
+  --mode vllm \
+  --model $MODEL_NAME \
+  --data $SPLIT \
+  --eval-dir results/$SPLIT/$MODEL_NAME \
+  --sampling regenerate \
+  --num-generations 10
+```
+When done, kill the VLLM server:
+```bash
+pkill -f vllm
+```
+
+#### WITH TRANSFORMERS (slower than VLLM, but more flexible)
+
+```bash
+uv run python src/inference.py \
+  --mode transformers \
+  --model $MODEL_NAME \
+  --data $SPLIT \
+  --eval-dir results/$SPLIT/$MODEL_NAME \
+  --sampling regenerate \
+  --num-generations 10
+```
+
+2. **Partition**: Group semantically similar responses
+
+```bash
+uv run python src/partition.py \
+  --eval-dir results/$SPLIT/$MODEL_NAME \
+  --alg classifier
+```
+
+3. **Score**: Evaluate the quality of responses
+
+```bash
+uv run python src/score.py \
+  --eval-dir results/$SPLIT/$MODEL_NAME \
+  --patience 0.8
+```
+
+4. **Summarize**: Analyze and visualize results
+```bash
+uv run python src/summarize.py --eval-dir results/$SPLIT/$MODEL_NAME
+```
