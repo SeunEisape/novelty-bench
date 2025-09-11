@@ -4,9 +4,15 @@ See [project webpage](https://novelty-bench.github.io/) for the dataset, evaluat
 
 ## Installation
 
+via pip:
 ```shell
 # Install dependencies
 pip install -e .
+```
+
+via uv:
+``shell
+uv sync
 ```
 
 ## Usage
