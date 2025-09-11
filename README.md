@@ -11,7 +11,7 @@ pip install -e .
 ```
 
 via uv:
-``shell
+```shell
 uv sync
 ```
 
