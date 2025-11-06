@@ -3,6 +3,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+.env
+openai-api-key
+*.secrets
+
 # C extensions
 *.so
 
