@@ -167,6 +167,94 @@ class DeepSeekService(OpenAIService):
                 base_url="https://openrouter.ai/api/v1", api_key=file.read().strip()
             )
 
+import gzip
+import random
+import glob
+
+def get_sample_text_reservoir(data_dir, max_doc_tokens=2000):
+    """
+    Efficiently sample from large .json.gz files using reservoir sampling.
+    Only requires ONE pass through the file - much faster than counting lines first.
+    """
+    file_list = glob.glob(os.path.join(data_dir, "*.json.gz"))
+    if not file_list:
+        print(f"No .json.gz files found in {data_dir}")
+        return "", ""
+    
+    file_path = random.choice(file_list)
+    
+    try:
+        selected_record = None
+        line_count = 0
+        
+        # Single pass with reservoir sampling
+        with gzip.open(file_path, "rt", encoding="utf-8") as f:
+            for line in f:
+                line_count += 1
+                
+                try:
+                    record = json.loads(line)
+                    
+                    # Reservoir sampling: replace current selection with probability 1/line_count
+                    if line_count == 1:
+                        # Always keep the first valid record
+                        selected_record = record
+                    elif random.random() < (1.0 / line_count):
+                        # Replace with probability 1/line_count
+                        selected_record = record
+                        
+                except json.JSONDecodeError as e:
+                    print(f"Warning: Skipping malformed JSON line {line_count}: {e}")
+                    continue
+        
+        if selected_record is None:
+            print(f"No valid JSON records found in {file_path}")
+            return "", ""
+        
+        text = selected_record.get("text", "")
+        
+        # Truncate text if it's too long
+        if text and max_doc_tokens > 0:
+            text = truncate_text_by_tokens(text, max_doc_tokens)
+        
+        return text, file_path
+        
+    except Exception as e:
+        print(f"Error processing file {file_path}: {e}")
+        return "", ""
+
+def truncate_text_by_tokens(text, max_tokens, tokenizer=None):
+    """
+    Truncate text to fit within max_tokens limit.
+    If no tokenizer is provided, use rough word-based estimation (1 token ≈ 0.75 words).
+    """
+    if not text or max_tokens <= 0:
+        return text
+    
+    if tokenizer is not None:
+        try:
+            # Use actual tokenizer if provided
+            tokens = tokenizer.encode(text)
+            if len(tokens) <= max_tokens:
+                return text
+            truncated_tokens = tokens[:max_tokens]
+            return tokenizer.decode(truncated_tokens)
+        except Exception as e:
+            print(f"Warning: Tokenizer failed, falling back to word estimation: {e}")
+            # Fall through to estimation method
+    
+    # Use rough estimation: 1 token ≈ 0.75 words, so max_words ≈ max_tokens * 0.75
+    words = text.split()
+    max_words = int(max_tokens * 0.75)
+    
+    if len(words) <= max_words:
+        return text
+    
+    # Truncate at word boundaries
+    truncated_words = words[:max_words]
+    return ' '.join(truncated_words)
+
+
 
 class TransformersService(InferenceService):
     def __init__(self, model: str):
@@ -307,10 +395,16 @@ async def run_generation(
     prompt_paraphrases: list[str] | None,
     num_generations: int,
     sampling: str,
+    data_dir: str = "/home/eisape/projects/diversify_lm_output/dolma/data_sample",
     max_retries: int = 10,
 ) -> list[str]:
     responses = []
+
+    sample_text, _ = get_sample_text_reservoir(data_dir, max_doc_tokens=1500)
+    if sample_text:
+        prompt = f"{sample_text}\n\n---\n\n{prompt}"
     messages = [{"role": "user", "content": prompt}]
+    print(messages)
     for attempt in range(max_retries):
         try:
             if sampling == "regenerate":
@@ -431,6 +525,7 @@ async def process_prompts(
 
 async def main():
     parser = argparse.ArgumentParser()
+
     parser.add_argument(
         "--mode",
         choices=[
@@ -447,6 +542,7 @@ async def main():
         required=True,
         help="Inference service provider (vllm for local server, openai for API, transformers for local HF models, etc.)",
     )
+
     parser.add_argument("--model", required=True, help="Model to run inference with")
     parser.add_argument(
         "--eval-dir", help="Directory to save evaluation results", required=True

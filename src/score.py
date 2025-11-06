@@ -56,7 +56,7 @@ class Rating(BaseModel):
 @torch.inference_mode()
 async def score_partition_rm(
     prompt: str, generations: list[str], partition: list[int]
-) -> tuple[list[int], list[int]]:
+) -> tuple[list[int], list[int], list[float], list[float]]:
     """Asynchronously scores the partition."""
     rm, tokenizer = rm_and_tokenizer()
     convs = [
@@ -64,6 +64,8 @@ async def score_partition_rm(
             {"content": prompt, "role": "user"},
             {"content": generation, "role": "assistant"},
         ]
+
+# TODO: print prompt
         for generation in generations
     ]
     batch = tokenizer.apply_chat_template(
@@ -82,18 +84,23 @@ async def score_partition_rm(
 
     generation_scores = []
     partition_scores = []
+    generation_raw_rewards = []
+    partition_raw_rewards = []
 
-    for s, p in zip(scores, partition, strict=False):
+    for s, r, p in zip(scores, raw_rewards, partition, strict=False):
         if p == len(partition_scores):
             generation_scores.append(s)
             partition_scores.append(s)
+            generation_raw_rewards.append(r)
+            partition_raw_rewards.append(r)
         else:
             generation_scores.append(0)
+            generation_raw_rewards.append(r)
 
     assert len(partition_scores) == (max(partition) + 1), (
         f"partition_scores: {partition_scores}, partition: {partition}"
     )
-    return generation_scores, partition_scores
+    return generation_scores, partition_scores, generation_raw_rewards, partition_raw_rewards
 
 
 async def process_instances(instances, output_file, patience):
@@ -113,7 +120,7 @@ async def process_instances(instances, output_file, patience):
 
         async def process_single_instance(instance):
             async with semaphore:
-                generation_scores, partition_scores = await score_partition_rm(
+                generation_scores, partition_scores, generation_raw_rewards, partition_raw_rewards = await score_partition_rm(
                     instance["prompt"],
                     instance["generations"],
                     instance["partition"],
@@ -126,6 +133,8 @@ async def process_instances(instances, output_file, patience):
                     **instance,
                     "generation_scores": generation_scores,
                     "partition_scores": partition_scores,
+                    "generation_raw_rewards": generation_raw_rewards,
+                    "partition_raw_rewards": partition_raw_rewards,
                     "utility": utility,
                 }
 
