@@ -18,6 +18,18 @@ uv sync
 ## Usage
 
 ### Basic Workflow
+gemma 4b
+gemma 12b 
+llama 8b 
+llama-3.1-8B-Instruct
+olmo 7b
+olmo 13b
+OLMo-2-1124-13B-Instruct
+
+gpu -- vllm serve google/gemma-3-12b-it --port 8001
+---------------------------------------------------
+export VLLM_PORT=8001
+python /home/eisape/projects/diversify_lm_output/novelty-bench/src/normal_inference.py --mode vllm --model google/gemma-3-12b-it --data curated --eval-dir /home/eisape/projects/diversify_lm_output/novelty-bench/results/normal_temp_1/gemma-3-12b-it --num-generations 10
 
 1. **Inference**: Generate multiple responses from language models
 
@@ -30,11 +42,12 @@ uv sync
    ```shell
    python src/partition.py --eval-dir results/curated/gpt4o --alg classifier
    ```
-
+gpu -- python src/partition.py --eval-dir /home/eisape/projects/diversify_lm_output/novelty-bench/results/random_doc_sample/ge --alg classifier
 3. **Score**: Evaluate the quality of responses
 
+OLMo-2-1124-7B-Instruct
    ```shell
-   python src/score.py --eval-dir results/curated/gpt4o --patience 0.8
+   gpu -- python src/score.py --eval-dir /home/eisape/projects/diversify_lm_output/novelty-bench/results/random_doc_sample/OLMo-2-1124-13B-Instruct --patience 0.8
    ```
 
 4. **Summarize**: Analyze and visualize results

@@ -167,107 +167,6 @@ class DeepSeekService(OpenAIService):
                 base_url="https://openrouter.ai/api/v1", api_key=file.read().strip()
             )
 
-import gzip
-import random
-import glob
-
-def get_sample_text_reservoir(data_dir, max_doc_tokens=2000):
-    """
-    Efficiently sample from large .json.gz files using reservoir sampling.
-    Only requires ONE pass through the file - much faster than counting lines first.
-    """
-    file_list = glob.glob(os.path.join(data_dir, "*.json.gz"))
-    if not file_list:
-        print(f"No .json.gz files found in {data_dir}")
-        return "", ""
-    
-    file_path = random.choice(file_list)
-    
-    try:
-        selected_record = None
-        line_count = 0
-        
-        # Single pass with reservoir sampling
-        with gzip.open(file_path, "rt", encoding="utf-8") as f:
-            for line in f:
-                line_count += 1
-                
-                try:
-                    record = json.loads(line)
-                    
-                    # Reservoir sampling: replace current selection with probability 1/line_count
-                    if line_count == 1:
-                        # Always keep the first valid record
-                        selected_record = record
-                    elif random.random() < (1.0 / line_count):
-                        # Replace with probability 1/line_count
-                        selected_record = record
-                        
-                except json.JSONDecodeError as e:
-                    print(f"Warning: Skipping malformed JSON line {line_count}: {e}")
-                    continue
-        
-        if selected_record is None:
-            print(f"No valid JSON records found in {file_path}")
-            return "", ""
-        
-        text = selected_record.get("text", "")
-        
-        # Truncate text if it's too long
-        if text and max_doc_tokens > 0:
-            text = truncate_text_by_tokens(text, max_doc_tokens)
-        
-        return text, file_path
-        
-    except Exception as e:
-        print(f"Error processing file {file_path}: {e}")
-        return "", ""
-
-def truncate_text_by_tokens(text, max_tokens, tokenizer=None):
-    """
-    Truncate text to fit within max_tokens limit.
-    If no tokenizer is provided, use rough word-based estimation (1 token ≈ 0.75 words).
-    """
-    if not text or max_tokens <= 0:
-        return text
-    
-    if tokenizer is not None:
-        try:
-            # Use actual tokenizer if provided
-            tokens = tokenizer.encode(text)
-            if len(tokens) <= max_tokens:
-                return text
-            truncated_tokens = tokens[:max_tokens]
-            return tokenizer.decode(truncated_tokens)
-        except Exception as e:
-            print(f"Warning: Tokenizer failed, falling back to word estimation: {e}")
-            # Fall through to estimation method
-    
-    # Use rough estimation: 1 token ≈ 0.75 words, so max_words ≈ max_tokens * 0.75
-    words = text.split()
-    max_words = int(max_tokens * 0.75)
-    
-    if len(words) <= max_words:
-        return text
-    
-    # Truncate at word boundaries
-    truncated_words = words[:max_words]
-    return ' '.join(truncated_words)
-
-
-def load_documents_from_jsonl(jsonl_path, max_doc_tokens=1500, tokenizer=None):
-    """Load document texts from a pre-sampled JSONL file."""
-    documents = []
-    with open(jsonl_path, "r", encoding="utf-8") as f:
-        for line in f:
-            record = json.loads(line.strip())
-            text = record.get("text", "")
-            if text and max_doc_tokens > 0:
-                text = truncate_text_by_tokens(text, max_doc_tokens, tokenizer=tokenizer)
-            documents.append(text)
-    print(f"Loaded {len(documents)} documents from {jsonl_path}")
-    return documents
-
 
 class TransformersService(InferenceService):
     def __init__(self, model: str):
@@ -276,20 +175,21 @@ class TransformersService(InferenceService):
         self.tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
         try:
             self.model = AutoModelForCausalLM.from_pretrained(
-                model,
+                model, 
                 trust_remote_code=True,
-                torch_dtype=torch.bfloat16,
+                dtype=torch.bfloat16,
                 device_map="auto",
                 attn_implementation="flash_attention_2"  # Use flash attention if available
             )
         except:
             print("Flash attention not available, falling back to eager attention")
             self.model = AutoModelForCausalLM.from_pretrained(
-                model,
+                model, 
                 trust_remote_code=True,
-                torch_dtype=torch.bfloat16,
+                dtype=torch.bfloat16,
                 device_map="auto",
                 attn_implementation="eager",
+                stop=["<|end_of_text|>", "<eos>", "<end_of_turn>"] # need to be overridden for other models
             )
         
         # Set pad token if it doesn't exist
@@ -407,62 +307,23 @@ async def run_generation(
     prompt_paraphrases: list[str] | None,
     num_generations: int,
     sampling: str,
-    sample_texts: list[str] | None = None,
-    data_dir: str = "/home/eisape/projects/diversify_lm_output/dolma/data_sample",
     max_retries: int = 10,
-) -> tuple[list[str], list[str]]:
-    """
-    Generate responses for a prompt, each with a different prepended document.
-
-    If sample_texts is provided (list of length num_generations), each generation
-    gets its own document prepended. Otherwise falls back to sampling one document
-    on the fly from data_dir (legacy behavior).
-
-    Returns (responses, prepended_docs) where both are lists of length num_generations.
-    """
-    if sample_texts is None:
-        # Legacy: sample one doc on the fly, shared across all generations
-        sample_text, _ = get_sample_text_reservoir(data_dir, max_doc_tokens=1500)
-        sample_texts_used = [sample_text] * num_generations
-    else:
-        sample_texts_used = sample_texts
-
-    def _make_prompt(doc, text):
-        return f"{doc}\n\n---\n\n{text}" if doc else text
-
+) -> list[str]:
+    responses = []
+    messages = [{"role": "user", "content": prompt}]
     for attempt in range(max_retries):
         try:
             if sampling == "regenerate":
-                if sample_texts is not None:
-                    # Each generation gets its own document — individual concurrent calls
-                    coros = []
-                    for i in range(num_generations):
-                        full_prompt = _make_prompt(sample_texts_used[i], prompt)
-                        msgs = [{"role": "user", "content": full_prompt}]
-                        coros.append(
-                            service.generate(
-                                model=model, messages=msgs, max_tokens=512, temperature=1.0,
-                            )
-                        )
-                    results = await asyncio.gather(*coros)
-                    responses = [r[0] for r in results]
-                else:
-                    # Legacy: single call with n=num_generations, same doc for all
-                    full_prompt = _make_prompt(sample_texts_used[0], prompt)
-                    messages = [{"role": "user", "content": full_prompt}]
-                    responses = await service.generate(
-                        model=model,
-                        messages=messages,
-                        max_tokens=512,
-                        temperature=1.0,
-                        n=num_generations,
-                    )
+                # parallel generation w/o context
+                responses = await service.generate(
+                    model=model,
+                    messages=messages,
+                    max_tokens=512,
+                    temperature=1.0,
+                    n=num_generations,
+                )
 
             elif sampling == "in-context":
-                # In-context chains share the first document for the initial prompt
-                full_prompt = _make_prompt(sample_texts_used[0], prompt)
-                messages = [{"role": "user", "content": full_prompt}]
-                responses = []
                 while len(responses) < num_generations:
                     response = await service.generate(
                         model=model,
@@ -479,63 +340,41 @@ async def run_generation(
                             "content": "Can you generate a different answer?",
                         }
                     )
-                # All generations share the first doc in this mode
-                sample_texts_used = [sample_texts_used[0]] * num_generations
 
             elif sampling == "paraphrase":
                 assert prompt_paraphrases and len(prompt_paraphrases) == num_generations
-                responses = []
-                coros = []
-                for i in range(num_generations):
-                    full_prompt = _make_prompt(sample_texts_used[i], prompt_paraphrases[i])
-                    msgs = [{"role": "user", "content": full_prompt}]
-                    coros.append(
-                        service.generate(
-                            model=model, messages=msgs, max_tokens=512, temperature=1.0,
-                        )
-                    )
-                results = await asyncio.gather(*coros)
-                responses = [r[0] for r in results]
-
-            elif sampling == "system-prompt":
-                if sample_texts is not None:
-                    coros = []
-                    for i in range(num_generations):
-                        full_prompt = _make_prompt(sample_texts_used[i], prompt)
-                        msgs = [
-                            {
-                                "role": "system",
-                                "content": "You are a producer of unique answers, and you strive to tell each user a novel answer to their question.",
-                            },
-                            {"role": "user", "content": full_prompt},
-                        ]
-                        coros.append(
-                            service.generate(
-                                model=model, messages=msgs, max_tokens=512, temperature=1.0,
-                            )
-                        )
-                    results = await asyncio.gather(*coros)
-                    responses = [r[0] for r in results]
-                else:
-                    full_prompt = _make_prompt(sample_texts_used[0], prompt)
+                while len(responses) < num_generations:
                     messages = [
-                        {
-                            "role": "system",
-                            "content": "You are a producer of unique answers, and you strive to tell each user a novel answer to their question.",
-                        },
-                        {"role": "user", "content": full_prompt},
+                        {"role": "user", "content": prompt_paraphrases[len(responses)]}
                     ]
-                    responses = await service.generate(
+                    response = await service.generate(
                         model=model,
                         messages=messages,
                         max_tokens=512,
                         temperature=1.0,
-                        n=num_generations,
                     )
+                    new_response = response[0]
+                    responses.append(new_response)
+
+            elif sampling == "system-prompt":
+                messages = [
+                    {
+                        "role": "system",
+                        "content": "You are a producer of unique answers, and you strive to tell each user a novel answer to their question.",
+                    },
+                    {"role": "user", "content": prompt},
+                ]
+                responses = await service.generate(
+                    model=model,
+                    messages=messages,
+                    max_tokens=512,
+                    temperature=1.0,
+                    n=num_generations,
+                )
             else:
                 raise Exception("Unknown mode " + sampling)
 
-            return responses, sample_texts_used
+            return responses
 
         except Exception as e:
             if attempt == max_retries - 1:  # Last attempt
@@ -543,12 +382,12 @@ async def run_generation(
                     f"Error generating response for prompt '{prompt}' after {max_retries} attempts: {e}",
                     flush=True,
                 )
-                return [], sample_texts_used
+                return []
 
             # Exponential backoff
             wait_time = min(5 * 2**attempt, 60)  # 5, 10, 20, 40, 60, 60, ... seconds
             print(
-                f"Attempt {attempt + 1} failed with error: {type(e).__name__}: {e}. Retrying in {wait_time} seconds...",
+                f"Attempt {attempt + 1} failed, retrying in {wait_time} seconds...",
                 flush=True,
             )
             await asyncio.sleep(wait_time)
@@ -562,7 +401,6 @@ async def process_prompts(
     num_generations,
     concurrent_requests,
     sampling,
-    prompt_id_to_docs=None,
 ):
     """Processes all prompts concurrently and writes results to a file."""
     async with aio_open(output_file, "a", buffering=1) as f:
@@ -570,24 +408,19 @@ async def process_prompts(
 
         async def process_single_prompt(prompt):
             async with semaphore:
-                doc_slice = None
-                if prompt_id_to_docs is not None:
-                    doc_slice = prompt_id_to_docs.get(prompt["id"])
-                generations, random_prepended_docs = await run_generation(
+                generations = await run_generation(
                     service,
                     model,
                     prompt["prompt"],
                     prompt.get("prompt_paraphrases"),
                     num_generations,
                     sampling,
-                    sample_texts=doc_slice,
                 )
                 return {
                     "id": prompt["id"],
                     "prompt": prompt["prompt"],
                     "model": model,
                     "generations": generations,
-                    "random_prepended_doc": random_prepended_docs,
                 }
 
         tasks = [process_single_prompt(prompt) for prompt in prompts]
@@ -598,7 +431,6 @@ async def process_prompts(
 
 async def main():
     parser = argparse.ArgumentParser()
-
     parser.add_argument(
         "--mode",
         choices=[
@@ -615,7 +447,6 @@ async def main():
         required=True,
         help="Inference service provider (vllm for local server, openai for API, transformers for local HF models, etc.)",
     )
-
     parser.add_argument("--model", required=True, help="Model to run inference with")
     parser.add_argument(
         "--eval-dir", help="Directory to save evaluation results", required=True
@@ -643,90 +474,9 @@ async def main():
         default=10,
         help="Number of concurrent requests",
     )
-    parser.add_argument(
-        "--docs-file",
-        type=str,
-        default=None,
-        help="Path to a JSONL file with pre-sampled documents. "
-        "Each line should have a 'text' field. "
-        "Requires num_prompts * num_generations documents. "
-        "Each generation gets its own document prepended.",
-    )
-    parser.add_argument(
-        "--max-doc-tokens",
-        type=int,
-        default=1500,
-        help="Maximum number of tokens for each prepended document (default: 1500)",
-    )
-    parser.add_argument(
-        "--max-context-tokens",
-        type=int,
-        default=None,
-        help="Model's maximum context window size. When set, --max-doc-tokens is "
-        "clamped so that doc + prompt + generation tokens fit within this limit.",
-    )
     args = parser.parse_args()
 
     dataset = load_dataset("yimingzhang/novelty-bench", split=args.data)
-
-    # Compute effective max_doc_tokens, clamping to fit within the context window
-    max_doc_tokens = args.max_doc_tokens
-    max_generation_tokens = 512  # hardcoded in run_generation
-    tokenizer = None
-
-    if args.docs_file and args.max_context_tokens:
-        print(f"Loading tokenizer for {args.model} to compute context budget...")
-        tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-
-        # Find the longest prompt to compute worst-case budget
-        max_prompt_tokens = 0
-        for item in dataset:
-            prompt_tokens = len(tokenizer.encode(item["prompt"]))
-            max_prompt_tokens = max(max_prompt_tokens, prompt_tokens)
-
-        # Reserve extra tokens for chat template overhead (special tokens, separators)
-        chat_overhead = 100
-        doc_token_budget = args.max_context_tokens - max_prompt_tokens - max_generation_tokens - chat_overhead
-
-        print(f"Context window: {args.max_context_tokens} tokens")
-        print(f"Max prompt tokens: {max_prompt_tokens}, Generation tokens: {max_generation_tokens}, "
-              f"Chat overhead: {chat_overhead}")
-        print(f"Doc token budget: {doc_token_budget}")
-
-        if doc_token_budget <= 0:
-            print(f"Error: Prompts ({max_prompt_tokens}) + generation ({max_generation_tokens}) + "
-                  f"overhead ({chat_overhead}) already exceeds context window ({args.max_context_tokens}). "
-                  f"Cannot prepend documents.")
-            return
-
-        if max_doc_tokens > doc_token_budget:
-            print(f"Clamping max_doc_tokens from {max_doc_tokens} to {doc_token_budget}")
-            max_doc_tokens = doc_token_budget
-
-    # Build prompt_id -> docs mapping BEFORE filtering, so doc assignment is
-    # stable across resumes.  Each prompt gets num_generations consecutive docs.
-    prompt_id_to_docs = None
-    if args.docs_file:
-        all_docs = load_documents_from_jsonl(args.docs_file, max_doc_tokens=max_doc_tokens, tokenizer=tokenizer)
-        needed = len(dataset) * args.num_generations
-        if len(all_docs) < needed:
-            print(
-                f"Warning: docs file has {len(all_docs)} documents but "
-                f"{needed} are needed ({len(dataset)} prompts * {args.num_generations} generations). "
-                f"Documents will be reused via wrapping."
-            )
-        prompt_id_to_docs = {}
-        for i, item in enumerate(dataset):
-            start = (i * args.num_generations) % len(all_docs)
-            end = start + args.num_generations
-            if end <= len(all_docs):
-                prompt_id_to_docs[item["id"]] = all_docs[start:end]
-            else:
-                # Wrap around
-                prompt_id_to_docs[item["id"]] = (
-                    all_docs[start:] + all_docs[: end - len(all_docs)]
-                )
-
     eval_dir = (
         args.eval_dir if args.eval_dir else os.path.join(f"{args.data}-evals", args.model)
     )
@@ -788,7 +538,6 @@ async def main():
             args.num_generations,
             concurrent_requests,
             args.sampling,
-            prompt_id_to_docs=prompt_id_to_docs,
         )
 
     finally:
